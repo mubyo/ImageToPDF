@@ -1,0 +1,7 @@
+__pycache__/
+build/
+dist/
+*.spec
+build.log
+qiita_article.md
+docs/screenshot_raw.png
