@@ -7,9 +7,10 @@
 import argparse
 import re
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, PdfImagePlugin
 
 EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tif", ".tiff", ".webp"}
 
@@ -36,8 +37,31 @@ def load_rgb(path: Path) -> Image.Image:
     return img.convert("RGB")
 
 
-def write_pdf(files, output: Path, dpi: float, label, log=print) -> bool:
-    """files: [(表示用の基準フォルダ, 画像パス), ...] を1つのPDFに書き出す"""
+@contextmanager
+def on_page_written(step):
+    """PDF保存中、1ページ書き込むごとに step() を呼ぶ。
+    Pillowは保存中の進捗を通知しないので、内部関数 _write_image (1ページ1回呼ばれる) を一時的に包む。
+    Pillowの版で関数がなければ何もしない (進捗が保存中に進まないだけ)"""
+    orig = getattr(PdfImagePlugin, "_write_image", None)
+    if step is None or orig is None:
+        yield
+        return
+
+    def hooked(*args, **kwargs):
+        result = orig(*args, **kwargs)
+        step()
+        return result
+
+    PdfImagePlugin._write_image = hooked
+    try:
+        yield
+    finally:
+        PdfImagePlugin._write_image = orig
+
+
+def write_pdf(files, output: Path, dpi: float, label, log=print, step=None) -> bool:
+    """files: [(表示用の基準フォルダ, 画像パス), ...] を1つのPDFに書き出す。
+    step: 進捗通知。画像1枚の読み込みごとと、1ページの書き込みごとに呼ぶ (合計 画像数×2 回)"""
     pages = []
     for i, (base, f) in enumerate(files, 1):
         try:
@@ -45,17 +69,23 @@ def write_pdf(files, output: Path, dpi: float, label, log=print) -> bool:
             log(f"[{i}/{len(files)}] {label(base, f)}")
         except Exception as e:
             log(f"[{i}/{len(files)}] スキップ: {f.name} ({e})")
+            if step:
+                step()  # 書き込まれない分も進めておく
+        if step:
+            step()
 
     if not pages:
         log("読み込める画像がありませんでした\n")
         return False
 
-    pages[0].save(output, "PDF", save_all=True, append_images=pages[1:], resolution=dpi)
+    log("PDFに書き込み中…")
+    with on_page_written(step):
+        pages[0].save(output, "PDF", save_all=True, append_images=pages[1:], resolution=dpi)
     log(f"完了: {output} ({len(pages)}ページ)\n")
     return True
 
 
-def convert(folder: Path, output: Path | None, recursive: bool, dpi: float, log=print) -> bool:
+def convert(folder: Path, output: Path | None, recursive: bool, dpi: float, log=print, step=None) -> bool:
     """1つのフォルダから1つのPDFを作る"""
     folder = folder.resolve()
     log(f"=== {folder} ===")
@@ -70,10 +100,10 @@ def convert(folder: Path, output: Path | None, recursive: bool, dpi: float, log=
 
     output = (output or folder.parent / f"{folder.name}.pdf").resolve()
     return write_pdf([(folder, f) for f in files], output, dpi,
-                     lambda base, f: str(f.relative_to(base)), log)
+                     lambda base, f: str(f.relative_to(base)), log, step)
 
 
-def combine(folders, output: Path | None, recursive: bool, dpi: float, log=print) -> bool:
+def combine(folders, output: Path | None, recursive: bool, dpi: float, log=print, step=None) -> bool:
     """複数フォルダの画像をすべて1つのPDFにまとめる"""
     # エクスプローラーからのドロップ順は不定なので、フォルダ名順に並べ直す
     folders = sorted((Path(f).resolve() for f in folders), key=natural_key)
@@ -94,7 +124,7 @@ def combine(folders, output: Path | None, recursive: bool, dpi: float, log=print
     output = (output or folders[0].parent / f"{folders[0].name}_compilation.pdf").resolve()
     log("")
     return write_pdf(files, output, dpi,
-                     lambda base, f: f"{base.name}\\{f.relative_to(base)}", log)
+                     lambda base, f: f"{base.name}\\{f.relative_to(base)}", log, step)
 
 
 def main():

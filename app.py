@@ -8,7 +8,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from tkinterdnd2 import DND_FILES, TkinterDnD
 
-from images_to_pdf import combine, convert
+from images_to_pdf import collect_images, combine, convert
 
 APP_NAME = "ImageToPDF"
 
@@ -19,6 +19,7 @@ class App:
         self.folders: list[Path] = []
         self.logs: queue.Queue = queue.Queue()
         self.last_output_dir: Path | None = None
+        self.done, self.total = 0, 0  # 進捗 (作業スレッドが done を進める)
 
         root.title(APP_NAME)
         root.geometry("640x560")
@@ -106,34 +107,39 @@ class App:
             messagebox.showinfo(APP_NAME, "画像フォルダを追加してください。")
             return
         self.run_btn.configure(state="disabled")
-        self.progress.configure(mode="indeterminate")
-        self.progress.start(10)
+        self.done, self.total = 0, 0
+        self.progress.configure(value=0, maximum=1)
         folders, mode, recursive = list(self.folders), self.mode.get(), self.recursive.get()
         threading.Thread(target=self.work, args=(folders, mode, recursive), daemon=True).start()
 
+    def step(self):
+        # 作業スレッドから呼ばれる。画面への反映は flush_logs が行う
+        self.done += 1
+
     def work(self, folders, mode, recursive):
+        # 進捗の総数 = 画像の枚数 × 2 (読み込み + PDFへの書き込み)
+        self.total = 2 * sum(len(collect_images(f, recursive)) for f in folders if f.is_dir())
         try:
             if mode == "combine":
-                ok, total = int(combine(folders, None, recursive, 150, self.log)), 1
+                combine(folders, None, recursive, 150, self.log, self.step)
             else:
-                ok = sum(convert(f, None, recursive, 150, self.log) for f in folders)
-                total = len(folders)
-                self.log(f"{ok}/{total} 個のPDFを作成しました")
+                ok = sum(convert(f, None, recursive, 150, self.log, self.step) for f in folders)
+                self.log(f"{ok}/{len(folders)} 個のPDFを作成しました")
         except Exception as e:  # メモリ不足などで止まった場合も画面に表示する
-            ok, total = 0, 1
             self.log(f"エラー: {e}")
         self.last_output_dir = folders[0].resolve().parent
-        self.root.after(0, self.finish, ok, total)
+        self.root.after(0, self.finish)
 
-    def finish(self, ok, total):
-        self.progress.stop()
-        self.progress.configure(mode="determinate", value=0)
+    def finish(self):
+        self.done = self.total  # 途中で止まった場合も、バーは完了の位置にそろえる
+        self.update_progress()
         self.run_btn.configure(state="normal")
         self.open_btn.configure(state="normal")
-        if ok == total:
-            messagebox.showinfo(APP_NAME, "PDFの作成が完了しました。")
-        else:
-            messagebox.showwarning(APP_NAME, "一部のPDFを作成できませんでした。ログを確認してください。")
+        self.clear()
+
+    def update_progress(self):
+        if self.total:
+            self.progress.configure(maximum=self.total, value=min(self.done, self.total))
 
     def open_output(self):
         if self.last_output_dir:
@@ -147,6 +153,7 @@ class App:
         lines = []
         while not self.logs.empty():
             lines.append(self.logs.get())
+        self.update_progress()
         if lines:
             self.log_text.configure(state="normal")
             self.log_text.insert("end", "\n".join(lines) + "\n")
